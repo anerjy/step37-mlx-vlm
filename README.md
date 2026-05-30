@@ -1,3 +1,19 @@
+---
+library_name: mlx
+pipeline_tag: image-text-to-text
+license: apache-2.0
+base_model:
+- stepfun-ai/Step-3.7-Flash
+tags:
+- mlx
+- mlx-vlm
+- mlx-lm
+- step3p7
+- vision-language
+- multimodal
+- apple-silicon
+---
+
 # Step 3.7 Flash — MLX Adapter (text + vision)
 
 First MLX-native runtime adapter for [`stepfun-ai/Step-3.7-Flash`](https://huggingface.co/stepfun-ai/Step-3.7-Flash) — Step Robotics' multimodal model based on the step3p5 MoE backbone (Qwen3.6-A3B family) with a 47-layer PerceptionEncoder vision tower.

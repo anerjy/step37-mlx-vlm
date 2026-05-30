@@ -209,15 +209,23 @@ class Model(nn.Module):
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
         flat_image = image_embeds.reshape(-1, image_embeds.shape[-1])  # (N_img, hidden)
-        if flat_image.shape[0] < n_image_tokens:
-            # Pad with zeros if model produced fewer features than slots.
-            pad = mx.zeros(
-                (n_image_tokens - flat_image.shape[0], flat_image.shape[1]),
-                dtype=flat_image.dtype,
+        # Fail fast on placeholder/feature count mismatch — silent zero-pad
+        # would produce a model that hallucinates ("I see white" / "a man in
+        # a suit") instead of obviously erroring. Common causes: chat-template
+        # not in sync with processor (P3c multi-crop layout contract — see
+        # README bug #3), patch_pixel_values dropped by an engine cache layer,
+        # or num_patches array out of sync with the patch tensor.
+        if flat_image.shape[0] != n_image_tokens:
+            raise ValueError(
+                f"step3p7: vision feature count {flat_image.shape[0]} != "
+                f"image-token placeholder count {n_image_tokens} in input_ids. "
+                f"Likely chat-template ↔ processor placeholder-emission "
+                f"contract drift (per-image layout: "
+                f"[<patch_start>{{81×<im_patch>}}<patch_end>[<patch_newline>]?]×N "
+                f"+ <im_start>{{169×<im_patch>}}<im_end>). Check that "
+                f"chat_template.jinja emits ONE <im_patch> marker per image "
+                f"and Step3p7Processor._per_image_repl expands it correctly."
             )
-            flat_image = mx.concatenate([flat_image, pad], axis=0)
-        else:
-            flat_image = flat_image[:n_image_tokens]
 
         # Build (batch, seq_len, hidden) fill tensor. For each image-token
         # position (in scan order across the flattened mask), place the
