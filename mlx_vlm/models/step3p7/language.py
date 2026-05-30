@@ -187,12 +187,33 @@ class LanguageModel(nn.Module):
                 caches.append(KVCache())
         return caches
 
+    def make_mtp_cache(self):
+        """One KVCache per MTP layer (each MTP block is a full decoder layer).
+
+        Step3p5DecoderLayer's attention type is determined by `layer_idx`
+        — layers 45/46/47 land on `is_sliding` according to step3p5's
+        layer_types config. We mirror that by asking each MTP block's
+        underlying decoder layer whether it's sliding.
+        """
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+        if self.mtp is None:
+            return []
+        caches = []
+        for layer in self.mtp.layers:
+            block = layer.mtp_block
+            if getattr(block, "is_sliding", False):
+                caches.append(RotatingKVCache(max_size=self._args.sliding_window))
+            else:
+                caches.append(KVCache())
+        return caches
+
     def __call__(
         self,
         inputs: mx.array,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[List[Any]] = None,
+        return_hidden: bool = False,
         **kwargs,
     ):
         # Forward through Step3p5Body, optionally bypassing embed_tokens.
@@ -219,8 +240,58 @@ class LanguageModel(nn.Module):
             m = swa_mask if layer.is_sliding else full_mask
             h = layer(h, mask=m, cache=c)
 
+        # Capture pre-norm hidden state — MTP consumes the un-normed value
+        # (vLLM Step3p5MTP takes the residual stream out of the last
+        # backbone layer before final norm; the per-MTP-layer `hnorm`
+        # supplies its own normalization on the way in).
+        pre_norm_hidden = h
         h = body.norm(h)
-        return self.lm_head(h)
+        logits = self.lm_head(h)
+        if return_hidden:
+            return logits, pre_norm_hidden
+        return logits
+
+    def mtp_forward(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        mtp_cache: Optional[List[Any]] = None,
+        spec_step_idx: int = 0,
+    ) -> mx.array:
+        """Run one MTP step → logits for next-token prediction.
+
+        Args:
+            hidden_states: pre-norm hidden state from the most recent
+              backbone forward (shape `(B, T, H)` — typically `T=1` at
+              decode time for K=1 spec).
+            next_token_ids: ids whose embedding we condition on (the
+              token the backbone just emitted). Shape `(B, T)`.
+            mtp_cache: list returned by `make_mtp_cache` (or None).
+            spec_step_idx: which MTP layer to use (cycled mod num_mtp_layers).
+
+        Returns:
+            logits over vocab — `(B, T, V)`. Caller picks argmax /
+            samples to get the draft token for verification.
+        """
+        if self.mtp is None:
+            raise RuntimeError(
+                "mtp_forward called but LanguageModel.mtp is None — "
+                "check num_nextn_predict_layers in config."
+            )
+        embeds = self.model.embed_tokens(next_token_ids)
+        # Which MTP layer fires this step
+        current = spec_step_idx % self.mtp.num_mtp_layers
+        # Per-layer cache (KVCache built in make_mtp_cache)
+        c = mtp_cache[current] if mtp_cache is not None else None
+        fused = self.mtp(
+            embeds,
+            hidden_states,
+            spec_step_idx=spec_step_idx,
+            mask=None,  # decode-time single-token, causal trivially satisfied
+            cache=c,
+        )
+        # `fused` is already shared_head_norm'd by MTPModule — apply lm_head.
+        return self.lm_head(fused)
 
     @staticmethod
     def sanitize(weights):

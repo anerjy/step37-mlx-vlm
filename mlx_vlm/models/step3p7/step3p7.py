@@ -248,6 +248,7 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        return_hidden: bool = False,
         **kwargs,
     ):
         embed = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
@@ -256,7 +257,25 @@ class Model(nn.Module):
             inputs_embeds=embed.inputs_embeds,
             mask=mask,
             cache=cache,
+            return_hidden=return_hidden,
         )
+
+    # --- MTP pass-through ------------------------------------------------
+    # oMLX's scheduler invokes MTP via the outer Model wrapper; forward to
+    # LanguageModel so the scheduler doesn't need to know about the
+    # vision/language split.
+
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None, spec_step_idx=0):
+        return self.language_model.mtp_forward(
+            hidden_states, next_token_ids, mtp_cache=mtp_cache, spec_step_idx=spec_step_idx
+        )
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()
+
+    @property
+    def has_mtp(self):
+        return getattr(self.language_model, "mtp", None) is not None
 
     # --- weight sanitize -------------------------------------------------
 
