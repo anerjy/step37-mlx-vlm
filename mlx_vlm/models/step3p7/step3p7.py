@@ -287,6 +287,18 @@ class Model(nn.Module):
                 new_weights[k] = v
             elif k.startswith("vit_large_projector"):
                 new_weights[k] = v
+            elif k.startswith("model.layers.") or k == "model.embed_tokens.weight":
+                # MTP shard weights ship WITHOUT a `language_model.` prefix
+                # (Hikari07jp's BF16 extraction keeps the original stepfun-ai
+                # key naming). Route them into the text bucket so
+                # LanguageModel.sanitize can rewrite layer 45+ into
+                # mtp.layers.{0..2}.* (vLLM Step3p5MTP convention).
+                # model.embed_tokens.weight in the MTP shard is a BF16 copy
+                # of the backbone embedding; drop it — the backbone's quantized
+                # embed_tokens is already loaded from earlier shards.
+                if k == "model.embed_tokens.weight":
+                    continue
+                text_weights[k] = v
             else:
                 # multi_modal_projector / mm_* / image_newline / etc — drop
                 continue

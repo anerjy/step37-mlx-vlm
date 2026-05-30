@@ -74,6 +74,10 @@ class TextConfig(BaseModelConfig):
     swiglu_limits: Optional[List[float]] = None
     swiglu_limits_shared: Optional[List[float]] = None
     tie_word_embeddings: bool = False
+    # MTP / nextn (multi-token prediction) — Step 3.7 declares 3 in upstream
+    # BF16. NVFP4 / our 4-bit drop them; Hikari07jp re-extracted shard adds them
+    # back. LanguageModel.__init__ builds MTPModule iff this is > 0.
+    num_nextn_predict_layers: int = 0
 
 
 @dataclass
