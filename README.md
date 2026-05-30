@@ -121,6 +121,66 @@ Or call any OpenAI-compatible MLX engine with `model="Step-3.7-Flash-4bit"` and 
 - Vision: 4-corner color/shape recognition on 2000×1500 images, sun detection on 1920×1080 landscape — all correct
 - Long-context: 182K-token needle-in-haystack retrieval — correct answer, ~11 min wall (Step 3.7 4-bit is **slow-but-correct** vs the same generation's Huihui 8-bit Opus-distill at ~4.5 min)
 
+## Multi-Token Prediction (MTP) speculative decoding — experimental
+
+Step 3.7 ships 3 MTP heads (vLLM `Step3p5MTP`) trained against the upstream
+BF16 backbone. We ported the MTPModule + MTPLayer classes to MLX
+(`mlx_vlm/models/step3p7/language.py`) and wired `mtp_forward` /
+`make_mtp_cache` / `return_hidden` into both LanguageModel and the outer
+`Model` so the oMLX MTP draft/verify cycle (qwen35 PR 990-derived
+batch_generator patch) engages automatically when `mtp_enabled: True` is
+set in the model settings.
+
+**Status:** infrastructure works end-to-end — `MTP path activated for
+uid=N (model has mtp_forward, batch=1)` confirmed; draft/verify cycle
+executes; weights load cleanly. Draft quality on M3 Ultra with
+Hikari07jp's BF16 extraction is too low for net speedup:
+
+| Config | Overall TPS (warm, 200 tok) | Note |
+|---|---|---|
+| MTP off (`turboquant_kv: True`) | **45.6** | production default |
+| MTP on, no norm shift | 32.9 | 0.0% accept |
+| MTP on, +1 shift on 5 Gemma norms | 32.0 | 2.6-4.2% accept |
+| MTP on, +1 shift on 4 Gemma norms (no `shared_head_norm`) | 30.9 | 2.1% accept |
+
+Break-even for net speedup requires ≈ 43% accept rate; we observe 2-4%.
+
+**Likely remaining issues (next investigation):**
+
+1. **Embedding precision** — the MTP shard ships its own BF16
+   `model.embed_tokens.weight`; we currently drop it and reuse the
+   backbone's 4-bit quantized embedding via `self.model.embed_tokens`.
+   vLLM's `Step3p5AMultiTokenPredictor` keeps a separate embedding.
+   Add a BF16 `embed_tokens` to `MTPModule` + use it in `mtp_forward`.
+2. **shared_head_norm convention** — mean ≈ 1.70 is between Gemma
+   zero-centered (~0) and plain RMSNorm (~1-2.5). The current shift
+   decision (don't shift it) is empirical; pairing this with the
+   embedding fix above may reveal the correct convention.
+3. **Hidden state precision** — backbone forward returns hidden at
+   the dequantized 4-bit precision; MTP receives it via `return_hidden`
+   and feeds bf16 weights. Mixed precision might compound on the
+   `enorm/hnorm/eh_proj` fusion path.
+
+To experiment, set `mtp_enabled: True` and `turboquant_kv_enabled: False`
+(they're mutually exclusive per oMLX) in `your engine settings file`
+for `Step-3.7-Flash-4bit`, restart oMLX, and check
+`grep "MTP\[" your engine log` for accept rate. To run the
+shard rewrite yourself:
+
+```bash
+hf download Hikari07jp/Step-3.7-Flash-MTP-draft --local-dir /tmp/mtp-src
+python scripts/rewrite_mtp_shard.py \
+  /tmp/mtp-src/model.safetensors \
+  Step-3.7-Flash-4bit/model-00024-of-00024.safetensors
+# Then update model.safetensors.index.json so the 48 new keys point
+# at the new shard filename.
+```
+
+The `MLX_LM_MTP` patch from oMLX 0.3.10+ exposes its own
+`_is_mtp_compatible` allowlist; ours patches that list to recognise
+`step3p5` and `step3p7` model_types (see
+`patches/mlx_lm_mtp_compat.diff` for the one-line addition).
+
 ## License
 
 Adapter code: Apache-2.0 (see `LICENSE`). Upstream Step-3.7-Flash weights are licensed separately by Step Robotics — see [their model card](https://huggingface.co/stepfun-ai/Step-3.7-Flash) before redistributing.
