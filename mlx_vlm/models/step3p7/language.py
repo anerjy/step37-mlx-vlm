@@ -14,10 +14,120 @@ from mlx_lm.models.step3p5 import (
     Model as Step3p5Model,
     ModelArgs as Step3p5Args,
     Step3p5Model as Step3p5Body,
+    Step3p5DecoderLayer,
+    ZeroCenteredRMSNorm,
 )
 from mlx_lm.models.base import create_attention_mask
 
 from .config import TextConfig
+
+
+# ============================================================================
+# Multi-Token Prediction (MTP / nextn) — mirror of vLLM Step3p5MTP, ported to MLX.
+#
+# Hikari07jp/Step-3.7-Flash-MTP-draft (5.92 GB BF16) extracts 3 MTP layers from
+# the upstream Step-3.7-Flash BF16 checkpoint (originally trained by stepfun-ai;
+# discarded by the NVFP4 release). Reference vLLM source:
+#   vllm/model_executor/models/step3p5_mtp.py — class Step3p5MTP
+#
+# Per-layer architecture:
+#   enorm(embedding_t+1) + hnorm(hidden_t) → eh_proj(2D→D) → mtp_block (full
+#   decoder layer) → shared_head.norm → shared_head.head (= lm_head)
+#
+# Weight key contract (Hikari07jp original BF16 names → MLX-side names):
+#   model.layers.{45,46,47}.enorm.weight                → mtp.layers.{45-47}.enorm
+#   model.layers.{45,46,47}.hnorm.weight                → mtp.layers.{45-47}.hnorm
+#   model.layers.{45,46,47}.eh_proj.weight              → mtp.layers.{45-47}.eh_proj
+#   model.layers.{45,46,47}.input_layernorm.weight      → mtp.layers.X.mtp_block.input_layernorm
+#   model.layers.{45,46,47}.self_attn.q_proj.weight     → mtp.layers.X.mtp_block.self_attn.q_proj
+#   model.layers.{45,46,47}.mlp.gate_proj.weight        → mtp.layers.X.mtp_block.mlp.gate_proj
+#   ... (all transformer-block weights get .mtp_block. injected after .X.)
+#   model.layers.47.transformer.shared_head.norm.weight → mtp.layers.47.shared_head_norm
+#   model.layers.47.transformer.shared_head.output      → (shared with backbone lm_head)
+#
+# Spec dec dispatch (vLLM cycles spec_step_idx % num_mtp_layers, picking
+# layer 45 on step 0, 46 on step 1, 47 on step 2 for K=3; K=1 only uses 45):
+#   logits = mtp.compute_logits(mtp_forward(hidden, next_token_ids, spec_step_idx))
+#
+# This class block is dormant until an oMLX patch (patches/mlx_lm_mtp/
+# step3p5_model.py) wires `LanguageModel.mtp_forward` into the scheduler's
+# verify/accept loop. Without that wiring, MTP weights are still loaded
+# (so sanitize doesn't drop them) but the standard __call__ path ignores them.
+# ============================================================================
+
+
+class MTPLayer(nn.Module):
+    """One MTP head layer — mirror of vLLM Step3p5AMultiTokenPredictorLayer.
+
+    Combines the previous-step hidden state with the next-token embedding
+    (via two RMSNorms + a fused Linear), then runs a full decoder layer
+    on the fused representation.
+    """
+
+    def __init__(self, args: Step3p5Args, layer_idx: int):
+        super().__init__()
+        eps = args.rms_norm_eps
+        H = args.hidden_size
+        self.enorm = ZeroCenteredRMSNorm(H, eps=eps)
+        self.hnorm = ZeroCenteredRMSNorm(H, eps=eps)
+        self.eh_proj = nn.Linear(H * 2, H, bias=False)
+        # mtp_block is a full Step3p5 decoder layer. The MTP layer_idx lives
+        # at position `num_hidden_layers + offset` (45/46/47 for Step 3.7),
+        # but we hand the underlying Step3p5DecoderLayer the original idx
+        # so its layer-type lookup / rope theta indexing match upstream.
+        self.mtp_block = Step3p5DecoderLayer(args, layer_idx)
+        # shared_head.norm is per-MTP-layer; shared_head.output (lm_head) is
+        # tied to backbone.lm_head — we don't allocate it here.
+        self.shared_head_norm = ZeroCenteredRMSNorm(H, eps=eps)
+
+    def __call__(
+        self,
+        inputs_embeds: mx.array,
+        previous_hidden_states: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Any = None,
+    ) -> mx.array:
+        e = self.enorm(inputs_embeds)
+        h = self.hnorm(previous_hidden_states)
+        fused = self.eh_proj(mx.concatenate([e, h], axis=-1))
+        return self.mtp_block(fused, mask=mask, cache=cache)
+
+
+class MTPModule(nn.Module):
+    """Multi-Token Predictor module — mirror of vLLM Step3p5AMultiTokenPredictor.
+
+    Holds `num_nextn_predict_layers` MTPLayer instances indexed by their
+    absolute layer position (`num_hidden_layers .. num_hidden_layers +
+    num_mtp - 1`). vLLM uses a ModuleDict keyed by str(layer_idx); we
+    mirror that so weight key indices line up directly.
+    """
+
+    def __init__(self, args: Step3p5Args, mtp_start_layer_idx: int, num_mtp_layers: int):
+        super().__init__()
+        self.mtp_start_layer_idx = mtp_start_layer_idx
+        self.num_mtp_layers = num_mtp_layers
+        # MLX nn.Module doesn't have nn.ModuleDict; use a plain dict of
+        # str-keyed children. nn.Module registers them via __setattr__
+        # only if assigned as direct attrs OR appended to a list — store
+        # in `self.layers` as a list, expose by absolute idx via a property.
+        self.layers = [
+            MTPLayer(args, mtp_start_layer_idx + k)
+            for k in range(num_mtp_layers)
+        ]
+
+    def __call__(
+        self,
+        input_embeds: mx.array,
+        previous_hidden_states: mx.array,
+        spec_step_idx: int = 0,
+        mask: Optional[mx.array] = None,
+        cache: Any = None,
+    ) -> mx.array:
+        """Run one MTP step. spec_step_idx is wrapped mod num_mtp_layers."""
+        current = spec_step_idx % self.num_mtp_layers
+        layer = self.layers[current]
+        h = layer(input_embeds, previous_hidden_states, mask=mask, cache=cache)
+        return layer.shared_head_norm(h)
 
 
 def _make_step3p5_args(text_cfg: TextConfig) -> Step3p5Args:
@@ -29,7 +139,16 @@ def _make_step3p5_args(text_cfg: TextConfig) -> Step3p5Args:
 
 
 class LanguageModel(nn.Module):
-    """Wraps step3p5.Model with an inputs_embeds-aware __call__."""
+    """Wraps step3p5.Model with an inputs_embeds-aware __call__.
+
+    Also holds an optional MTPModule head for speculative decoding (oMLX
+    `mtp_enabled: True`). MTP module is built unconditionally when the
+    config declares `num_nextn_predict_layers > 0` — sanitize then routes
+    `model.layers.{45..47}.*` weights to `mtp.layers.{0..2}.*`. If MTP
+    weights are absent from the checkpoint, sanitize ignores `mtp.*`
+    routing and the head stays randomly initialized but unused — `__call__`
+    is the only consumer of the backbone and doesn't touch `self.mtp`.
+    """
 
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -41,6 +160,16 @@ class LanguageModel(nn.Module):
         self.model = inner.model
         self.lm_head = inner.lm_head
         self._args = args
+        # MTP head — present iff config has num_nextn_predict_layers > 0.
+        num_mtp = getattr(config, "num_nextn_predict_layers", 0) or 0
+        if num_mtp > 0:
+            self.mtp = MTPModule(
+                args,
+                mtp_start_layer_idx=args.num_hidden_layers,
+                num_mtp_layers=num_mtp,
+            )
+        else:
+            self.mtp = None
 
     @property
     def layers(self):
@@ -124,20 +253,63 @@ class LanguageModel(nn.Module):
             src in k and dst not in k for k in weights for src, dst in remappings
         )
 
-        # Determine "decoder layer count" so we know which layer indices to
-        # drop (MTP heads sit after the decoder).
-        # For Step 3.7 the text config has 45 decoder layers; any layer
-        # >= 45 is an MTP head and must be skipped.
+        # Layer index threshold — Step 3.7 has 45 backbone layers + up to 3 MTP
+        # layers (45, 46, 47). vLLM Step3p5MTP._rewrite_spec_layer_name routes
+        # these to `model.mtp_block.*`; we route to `mtp.layers.{X-45}.*` so
+        # MTPModule.layers[k] indices match its 0-based list.
         num_decoder_layers = 45
+        # Names that stay at the MTPLayer level (don't get .mtp_block. injected):
+        mtp_direct_names = ("enorm", "hnorm", "eh_proj", "shared_head")
         new_weights = {}
         for k, v in weights.items():
-            if ".mtp" in k:
-                continue
+            # Route layer 45+ to mtp.layers.{idx-45}.* — vLLM rewrite logic
             if "model.layers." in k:
                 parts = k.split(".")
                 if len(parts) > 2 and parts[2].isdigit():
-                    if int(parts[2]) >= num_decoder_layers:
+                    layer_idx = int(parts[2])
+                    if layer_idx >= num_decoder_layers:
+                        rel_idx = layer_idx - num_decoder_layers
+                        # `mlx.nn.Module` exposes a list as `attr.<idx>` keys
+                        # when loaded via load_weights, so `mtp.layers.0.<...>`
+                        # matches the MTPLayer at list index 0.
+                        new_prefix = f"mtp.layers.{rel_idx}"
+                        suffix = ".".join(parts[3:])
+                        # Strip optional `transformer.` segment first (vLLM rewrite
+                        # rule). Each MTP layer's shared_head ships under
+                        # `model.layers.X.transformer.shared_head.*` in the
+                        # Hikari07jp BF16 export — that's just a remnant of the
+                        # original vLLM layer-block wrapping.
+                        if suffix.startswith("transformer."):
+                            suffix = suffix[len("transformer."):]
+                        if any(suffix.startswith(n) for n in mtp_direct_names):
+                            # enorm / hnorm / eh_proj / shared_head sit directly
+                            # on the MTPLayer (not inside mtp_block).
+                            if suffix.startswith("shared_head."):
+                                # `shared_head.output` → tied to backbone.lm_head; drop
+                                if "shared_head.output" in suffix:
+                                    continue
+                                # `shared_head.norm.weight` → `shared_head_norm.weight`
+                                suffix = suffix.replace("shared_head.norm", "shared_head_norm")
+                            new_k = f"{new_prefix}.{suffix}"
+                        else:
+                            # transformer-block weights go under .mtp_block.
+                            new_k = f"{new_prefix}.mtp_block.{suffix}"
+                        # Apply the same MoE→switch_mlp remap to the rewritten key
+                        for src, dst in remappings:
+                            if src in new_k and dst not in new_k:
+                                new_k = new_k.replace(src, dst)
+                                break
+                        if is_vanilla and new_k.endswith(".weight") and "norm" in new_k:
+                            v = v + 1
+                        new_weights[new_k] = v
                         continue
+            # Pre-2026-05-30 behaviour: drop bare `.mtp` keys that aren't from
+            # the layer-45+ MTP weights (none expected; defensive).
+            if ".mtp." in k or k.startswith("mtp."):
+                # Unrouted MTP keys (e.g. legacy `mtp.head.*`) — drop, the new
+                # MTP module reuses backbone embed/lm_head.
+                continue
+            # Standard backbone weight — apply moe→switch_mlp remap
             for src, dst in remappings:
                 if src in k and dst not in k:
                     k = k.replace(src, dst)
