@@ -41,6 +41,36 @@ from safetensors.torch import save_file
 MTP_DIRECT_NAMES = ("enorm", "hnorm", "eh_proj", "shared_head")
 NUM_DECODER_LAYERS = 45  # Step 3.7 backbone — MTP layers start at index 45
 
+# Hikari07jp's BF16 MTP-draft shard stores these norms in vLLM's
+# **GemmaRMSNorm zero-centered convention** — vLLM computes
+# `(1 + weight) * normalize(x)` so its stored weights are tiny offsets
+# centered around 0 (e.g. enorm mean ≈ -0.26, input_layernorm mean ≈ 0.06).
+# MLX-side `ZeroCenteredRMSNorm` (despite the name) is actually plain
+# `mx.fast.rms_norm(x, weight, eps)` — no +1 baked in — so we must add 1
+# to these weights at extract time. Otherwise activations through the MTP
+# head are 10-20× too small and the head emits garbage (0% accept rate,
+# observed in production 2026-05-30 first bench).
+#
+# Affected keys (suffixes), per vLLM Step3p5MTP source:
+#   enorm.weight, hnorm.weight                     (Step3p5AMultiTokenPredictorLayer)
+#   mtp_block.input_layernorm.weight               (Step3p5DecoderLayer)
+#   mtp_block.post_attention_layernorm.weight      (Step3p5DecoderLayer)
+#   shared_head_norm.weight                        (SharedHead)
+# NOT applied to q_norm / k_norm (those are plain RMSNorm in vLLM too).
+GEMMA_NORM_SUFFIXES = (
+    ".enorm.weight",
+    ".hnorm.weight",
+    ".mtp_block.input_layernorm.weight",
+    ".mtp_block.post_attention_layernorm.weight",
+    # shared_head_norm intentionally OMITTED: its stored mean ≈ 1.70 (vs the
+    # other Gemma norms' mean ≈ 0), and the backbone's `model.norm.weight`
+    # mean ≈ 2.46 — same order of magnitude. Empirically, including it
+    # double-shifts to ≈ 2.70 which over-scales activations. First-bench
+    # accept rate caps at 4.2% with shift; experiment without shift to
+    # match the plain-RMSNorm storage Hikari07jp appears to have used for
+    # this one tensor.
+)
+
 
 def rewrite_key(src_key: str) -> str | None:
     """Return the MLX-side key name, or None if the tensor should be dropped."""
@@ -74,16 +104,24 @@ def main() -> int:
     args = ap.parse_args()
 
     new_tensors = {}
-    n_kept = n_dropped = 0
+    n_kept = n_dropped = n_shifted = 0
     with safe_open(str(args.src), framework="pt") as f:
         for k in f.keys():
             new_k = rewrite_key(k)
             if new_k is None:
                 n_dropped += 1
                 continue
-            new_tensors[new_k] = f.get_tensor(k)
+            t = f.get_tensor(k)
+            if any(new_k.endswith(sfx) for sfx in GEMMA_NORM_SUFFIXES):
+                # Add 1.0 to convert vLLM's Gemma zero-centered storage to MLX
+                # plain-RMSNorm format. Done in fp32 to avoid bf16 rounding loss
+                # near 1.0, then cast back to source dtype.
+                src_dtype = t.dtype
+                t = (t.to(dtype=__import__("torch").float32) + 1.0).to(src_dtype)
+                n_shifted += 1
+            new_tensors[new_k] = t
             n_kept += 1
-    print(f"kept={n_kept} dropped={n_dropped} total_out={len(new_tensors)}")
+    print(f"kept={n_kept} dropped={n_dropped} norm_shifted={n_shifted} total_out={len(new_tensors)}")
     save_file(new_tensors, str(args.dst), metadata={"format": "mlx"})
     print(f"wrote {args.dst} ({args.dst.stat().st_size / 1e9:.2f} GB)")
     return 0
