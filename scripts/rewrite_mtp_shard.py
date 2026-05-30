@@ -58,24 +58,37 @@ NUM_DECODER_LAYERS = 45  # Step 3.7 backbone — MTP layers start at index 45
 #   shared_head_norm.weight                        (SharedHead)
 # NOT applied to q_norm / k_norm (those are plain RMSNorm in vLLM too).
 GEMMA_NORM_SUFFIXES = (
+    # All norms in vLLM Step3p5 use GemmaRMSNorm — verified 2026-05-30 from
+    # vllm/model_executor/models/step3p5.py + layernorm.py:
+    #   GemmaRMSNorm.forward_native: weight = self.weight.data.float() + 1.0
+    # We pre-apply the +1 here so MLX's plain ZeroCenteredRMSNorm (= plain
+    # mx.fast.rms_norm) gets the equivalent effective scaling.
+    # Includes q_norm/k_norm even though MLX's backbone applies q_norm/k_norm
+    # via the same ZeroCenteredRMSNorm — the Step-3.7-Flash-4bit converter
+    # appears to have already pre-shifted backbone q_norm/k_norm (mean ≈ 1.28),
+    # and Hikari07jp's MTP shard is verbatim from upstream BF16 (no shift),
+    # so we need to shift MTP-shard q_norm/k_norm too.
+    # shared_head_norm intentionally LAST so it can be toggled off via
+    # ``--no-shift-shared-head`` if a future bench shows it harms accept rate.
     ".enorm.weight",
     ".hnorm.weight",
     ".mtp_block.input_layernorm.weight",
     ".mtp_block.post_attention_layernorm.weight",
-    # shared_head_norm intentionally OMITTED: its stored mean ≈ 1.70 (vs the
-    # other Gemma norms' mean ≈ 0), and the backbone's `model.norm.weight`
-    # mean ≈ 2.46 — same order of magnitude. Empirically, including it
-    # double-shifts to ≈ 2.70 which over-scales activations. First-bench
-    # accept rate caps at 4.2% with shift; experiment without shift to
-    # match the plain-RMSNorm storage Hikari07jp appears to have used for
-    # this one tensor.
+    ".mtp_block.self_attn.q_norm.weight",
+    ".mtp_block.self_attn.k_norm.weight",
+    ".shared_head_norm.weight",
 )
 
 
 def rewrite_key(src_key: str) -> str | None:
     """Return the MLX-side key name, or None if the tensor should be dropped."""
     if src_key == "model.embed_tokens.weight":
-        return None
+        # Route MTP-shard embed_tokens to MTPModule's dedicated bf16 embedding,
+        # NOT the backbone's 4-bit quantized one. vLLM's
+        # Step3p5AMultiTokenPredictor keeps a separate embedding; mirroring
+        # that avoids mixed-precision drift between the 4-bit backbone and
+        # the bf16 MTP head.
+        return "language_model.mtp.embed_tokens.weight"
     if not src_key.startswith("model.layers."):
         return src_key
     parts = src_key.split(".")
@@ -90,9 +103,13 @@ def rewrite_key(src_key: str) -> str | None:
         suffix = suffix[len("transformer."):]
     if any(suffix.startswith(n) for n in MTP_DIRECT_NAMES):
         if suffix.startswith("shared_head."):
-            if "shared_head.output" in suffix:
-                return None
+            # KEEP shared_head.output as per-MTP-layer lm_head — verified
+            # 2026-05-30 that the three shared_head.output entries for
+            # layers 45/46/47 are NOT identical (per-layer mean ≈
+            # 0.000008-0.000034 differ), so they are not tied to backbone
+            # lm_head. MTP layer needs its own.
             suffix = suffix.replace("shared_head.norm", "shared_head_norm")
+            suffix = suffix.replace("shared_head.output", "shared_head_output")
         return f"language_model.mtp.layers.{rel_idx}.{suffix}"
     return f"language_model.mtp.layers.{rel_idx}.mtp_block.{suffix}"
 

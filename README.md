@@ -121,45 +121,110 @@ Or call any OpenAI-compatible MLX engine with `model="Step-3.7-Flash-4bit"` and 
 - Vision: 4-corner color/shape recognition on 2000×1500 images, sun detection on 1920×1080 landscape — all correct
 - Long-context: 182K-token needle-in-haystack retrieval — correct answer, ~11 min wall (Step 3.7 4-bit is **slow-but-correct** vs the same generation's Huihui 8-bit Opus-distill at ~4.5 min)
 
-## Multi-Token Prediction (MTP) speculative decoding — experimental
+## Multi-Token Prediction (MTP) speculative decoding
 
 Step 3.7 ships 3 MTP heads (vLLM `Step3p5MTP`) trained against the upstream
-BF16 backbone. We ported the MTPModule + MTPLayer classes to MLX
-(`mlx_vlm/models/step3p7/language.py`) and wired `mtp_forward` /
+BF16 backbone. We port the MTPModule + MTPLayer classes to MLX
+(`mlx_vlm/models/step3p7/language.py`) and wire `mtp_forward` /
 `make_mtp_cache` / `return_hidden` into both LanguageModel and the outer
 `Model` so the oMLX MTP draft/verify cycle (qwen35 PR 990-derived
 batch_generator patch) engages automatically when `mtp_enabled: True` is
 set in the model settings.
 
-**Status:** infrastructure works end-to-end — `MTP path activated for
-uid=N (model has mtp_forward, batch=1)` confirmed; draft/verify cycle
-executes; weights load cleanly. Draft quality on M3 Ultra with
-Hikari07jp's BF16 extraction is too low for net speedup:
+**Status: works. 73-80% accept rate, lossless at temp=0, ~15% net speedup.**
 
-| Config | Overall TPS (warm, 200 tok) | Note |
+| Config (Step-3.7-Flash-4bit, M3 Ultra, 300 tok warm, 5 iters) | Overall TPS | Accept |
 |---|---|---|
-| MTP off (`turboquant_kv: True`) | **45.6** | production default |
-| MTP on, no norm shift | 32.9 | 0.0% accept |
-| MTP on, +1 shift on 5 Gemma norms | 32.0 | 2.6-4.2% accept |
-| MTP on, +1 shift on 4 Gemma norms (no `shared_head_norm`) | 30.9 | 2.1% accept |
+| MTP off (`turboquant_kv: True`) | 45.6 | n/a |
+| **MTP on (per-MTP-layer lm_head + BF16 embed + 7 norm shifts)** | **52.6** | **73-80%** |
 
-Break-even for net speedup requires ≈ 43% accept rate; we observe 2-4%.
+Per-prompt: short_code 60, physics 57, Chinese translation 49 tok/s.
+Greedy output is byte-identical to MTP-off (verified on 4 prompts).
 
-**Likely remaining issues (next investigation):**
+### What it took to get here
 
-1. **Embedding precision** — the MTP shard ships its own BF16
-   `model.embed_tokens.weight`; we currently drop it and reuse the
-   backbone's 4-bit quantized embedding via `self.model.embed_tokens`.
-   vLLM's `Step3p5AMultiTokenPredictor` keeps a separate embedding.
-   Add a BF16 `embed_tokens` to `MTPModule` + use it in `mtp_forward`.
-2. **shared_head_norm convention** — mean ≈ 1.70 is between Gemma
-   zero-centered (~0) and plain RMSNorm (~1-2.5). The current shift
-   decision (don't shift it) is empirical; pairing this with the
-   embedding fix above may reveal the correct convention.
-3. **Hidden state precision** — backbone forward returns hidden at
-   the dequantized 4-bit precision; MTP receives it via `return_hidden`
-   and feeds bf16 weights. Mixed precision might compound on the
-   `enorm/hnorm/eh_proj` fusion path.
+The hard part was identifying which weight-loading conventions Hikari07jp's
+BF16 extraction expected. With the wrong conventions, accept rate stuck at
+0-4% (slowdown vs baseline); with the right conventions, 75%.
+
+1. **Per-MTP-layer `shared_head.output` is NOT tied to backbone `lm_head`**
+   — biggest finding. Each of the 3 MTP layers in the upstream BF16 ships
+   its own `shared_head.output` weight (different per-layer means
+   0.000008/0.000029/0.000034). We were initially calling the backbone's
+   4-bit quantized `lm_head` from `mtp_forward`, which produced ~0% useful
+   draft tokens. Per-MTP-layer BF16 head jumped accept from 2-4% to 70-80%.
+   Detected by inspecting `model.layers.{45,46,47}.transformer.shared_head.output`
+   in the BF16 source and noticing the three rows aren't equal.
+2. **MTP-side `embed_tokens` is also separate from backbone** — vLLM
+   `Step3p5AMultiTokenPredictor` keeps its own `VocabParallelEmbedding`.
+   We add an `nn.Embedding` directly on `MTPModule` and route the BF16
+   `model.embed_tokens.weight` from the MTP shard there. (This alone
+   didn't move the needle, but it removes the mixed-precision drift
+   from `mtp_forward`'s input lookup.)
+3. **+1 norm shift on extract** — vLLM `GemmaRMSNorm.forward_native`
+   does `weight = stored + 1.0; rms_norm(x, weight, eps)`. MLX
+   `ZeroCenteredRMSNorm` is plain `mx.fast.rms_norm(x, weight, eps)` (no
+   +1 baked in despite the class name). We pre-add 1 to the 7 Gemma
+   norms in the MTP shard (`enorm`, `hnorm`, `mtp_block.input_layernorm`,
+   `mtp_block.post_attention_layernorm`, `mtp_block.self_attn.q_norm`,
+   `mtp_block.self_attn.k_norm`, `shared_head_norm`) at offline
+   extract time.
+4. **Pre-norm hidden state passed to MTP** — `LanguageModel.__call__`
+   returns the residual stream *before* `body.norm` when called with
+   `return_hidden=True`. vLLM `Step3p5Model.forward()` does the same.
+   Empirically pre-norm gives 73-80% accept; post-norm gave 1-2%.
+
+The mismatched-precision hypothesis (4-bit backbone vs BF16 MTP) wasn't
+the bottleneck — BF16 embed_tokens didn't move accept on its own. The
+hidden state precision wasn't either. The bottleneck was using the wrong
+lm_head.
+
+### How to use
+
+The MTP path activates automatically when these settings are set on
+`Step-3.7-Flash-4bit` (or your equivalent model id) in
+`your engine settings file`:
+
+```json
+{
+  "mtp_enabled": true,
+  "turboquant_kv_enabled": false
+}
+```
+
+`mtp_enabled` and `turboquant_kv_enabled` are mutually exclusive per oMLX
+(TurboQuant patches the attention path that MTP relies on). Bench results
+above are with TurboQuant OFF. Restart oMLX after changing settings:
+`bash restart your engine`. Verify activation in the log:
+
+```
+[engine] Native MTP patch applied for ... (model_type=step3p7, active)
+[batch_generator] MTP path activated for uid=N (model has mtp_forward, batch=1)
+[batch_generator] MTP[N] finish=length tokens=200 cycles=117 accept=82/117 (70.1%) ...
+```
+
+To reproduce the shard rewrite from scratch:
+
+```bash
+hf download Hikari07jp/Step-3.7-Flash-MTP-draft --local-dir /tmp/mtp-src
+python scripts/rewrite_mtp_shard.py \
+  /tmp/mtp-src/model.safetensors \
+  Step-3.7-Flash-4bit/model-00024-of-00024.safetensors
+# Then update model.safetensors.index.json so the 52 new keys point
+# at the new shard filename (49 layer + 3 shared_head_output entries).
+```
+
+### Acknowledgements
+
+- [Hikari07jp/Step-3.7-Flash-MTP-draft](https://huggingface.co/Hikari07jp/Step-3.7-Flash-MTP-draft)
+  — extracted BF16 MTP-draft layers from upstream
+  `stepfun-ai/Step-3.7-Flash`; the same weights run at ~80% accept in vLLM.
+- [oMLX](https://omlx.ai/) — `patches/mlx_lm_mtp/` ports mlx-lm PR 990's
+  MTP draft+verify batch_generator dispatch to oMLX's continuous-batching
+  scheduler. We add `step3p5` / `step3p7` to its compatible list.
+- [mlx-optiq/Gemma 4 spec dec post](https://mlx-optiq.com/blog/gemma-spec-decoding)
+  — the structurally identical 0%→3%→33% accept-rate fix narrative for
+  Gemma 4 spec dec on MLX was a useful template for diagnosing this one.
 
 To experiment, set `mtp_enabled: True` and `turboquant_kv_enabled: False`
 (they're mutually exclusive per oMLX) in `your engine settings file`

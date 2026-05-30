@@ -76,9 +76,17 @@ class MTPLayer(nn.Module):
         # but we hand the underlying Step3p5DecoderLayer the original idx
         # so its layer-type lookup / rope theta indexing match upstream.
         self.mtp_block = Step3p5DecoderLayer(args, layer_idx)
-        # shared_head.norm is per-MTP-layer; shared_head.output (lm_head) is
-        # tied to backbone.lm_head — we don't allocate it here.
+        # vLLM Step3p5MTP's SharedHead contains BOTH a norm AND a per-MTP-layer
+        # head (Linear projection to vocab). Verified 2026-05-30 by inspecting
+        # Hikari07jp's shard: the three shared_head.output weights for layers
+        # 45/46/47 are non-identical (per-layer means 0.000029/0.000008/0.000034
+        # — slightly different patterns), so they CANNOT be tied to the
+        # backbone lm_head. Each MTP layer has its own bf16 lm_head, trained
+        # separately during MTP-head fine-tuning. Using the backbone's 4-bit
+        # quantized lm_head for the MTP forward path was the missing piece
+        # that capped accept rate at 2-4%.
         self.shared_head_norm = ZeroCenteredRMSNorm(H, eps=eps)
+        self.shared_head_output = nn.Linear(H, args.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -106,6 +114,15 @@ class MTPModule(nn.Module):
         super().__init__()
         self.mtp_start_layer_idx = mtp_start_layer_idx
         self.num_mtp_layers = num_mtp_layers
+        # MTP-side embed_tokens — bf16, separate from the backbone's 4-bit
+        # quantized embedding. vLLM Step3p5AMultiTokenPredictor keeps its
+        # own copy via VocabParallelEmbedding; Hikari07jp's shard ships
+        # model.embed_tokens.weight which we route here. Empirically:
+        # reusing backbone's 4-bit embedding for the MTP forward pass
+        # introduces mixed-precision drift that may explain the low (<5%)
+        # accept rate we observed in the first port — try sourcing the
+        # MTP head's input embeddings from its own bf16 table.
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         # MLX nn.Module doesn't have nn.ModuleDict; use a plain dict of
         # str-keyed children. nn.Module registers them via __setattr__
         # only if assigned as direct attrs OR appended to a list — store
@@ -240,10 +257,10 @@ class LanguageModel(nn.Module):
             m = swa_mask if layer.is_sliding else full_mask
             h = layer(h, mask=m, cache=c)
 
-        # Capture pre-norm hidden state — MTP consumes the un-normed value
-        # (vLLM Step3p5MTP takes the residual stream out of the last
-        # backbone layer before final norm; the per-MTP-layer `hnorm`
-        # supplies its own normalization on the way in).
+        # MTP receives PRE-norm hidden (matches vLLM Step3p5Model.forward
+        # which returns hidden BEFORE applying self.norm). Empirically
+        # tested 2026-05-30: post-norm gives 1.0-2.1% accept, pre-norm
+        # gives 2.6-4.2% — pre-norm is correct.
         pre_norm_hidden = h
         h = body.norm(h)
         logits = self.lm_head(h)
@@ -278,7 +295,15 @@ class LanguageModel(nn.Module):
                 "mtp_forward called but LanguageModel.mtp is None — "
                 "check num_nextn_predict_layers in config."
             )
-        embeds = self.model.embed_tokens(next_token_ids)
+        # Use the MTP module's dedicated bf16 embedding (not backbone's
+        # 4-bit quantized embedding) for next_token_ids lookup. vLLM's
+        # Step3p5AMultiTokenPredictor uses its own VocabParallelEmbedding;
+        # we mirror that here. Falls back to backbone embed if MTP-side
+        # weights were not loaded (e.g. older shard format).
+        if hasattr(self.mtp, "embed_tokens") and self.mtp.embed_tokens.weight.shape[0] == self.model.embed_tokens.weight.shape[0]:
+            embeds = self.mtp.embed_tokens(next_token_ids)
+        else:
+            embeds = self.model.embed_tokens(next_token_ids)
         # Which MTP layer fires this step
         current = spec_step_idx % self.mtp.num_mtp_layers
         # Per-layer cache (KVCache built in make_mtp_cache)
@@ -290,8 +315,12 @@ class LanguageModel(nn.Module):
             mask=None,  # decode-time single-token, causal trivially satisfied
             cache=c,
         )
-        # `fused` is already shared_head_norm'd by MTPModule — apply lm_head.
-        return self.lm_head(fused)
+        # `fused` is already shared_head_norm'd by MTPModule. Now apply the
+        # per-MTP-layer lm_head (shared_head_output) — NOT the backbone
+        # lm_head, which would be wrong (per-MTP-layer heads have
+        # non-identical bf16 weights, verified from Hikari07jp's shard).
+        active_layer = self.mtp.layers[spec_step_idx % self.mtp.num_mtp_layers]
+        return active_layer.shared_head_output(fused)
 
     @staticmethod
     def sanitize(weights):
