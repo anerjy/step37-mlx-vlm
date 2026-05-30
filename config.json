@@ -1,0 +1,20 @@
+{
+  "_purpose": "Metadata-only descriptor for HF Hub download tracking. This repository is the MLX adapter CODE for stepfun-ai/Step-3.7-Flash on Apple Silicon — Python source under mlx_vlm/models/step3p7/ and mlx_lm/models/step3p7.py, plus chat_template patch and extract_vision_weights.py reproducer script. It does NOT contain model weights. To use: download stepfun-ai/Step-3.7-Flash separately, run scripts/extract_vision_weights.py to prepare the vision shard with NHWC Conv2d transpose, then drop the adapter into your mlx_vlm install. See README.md.",
+  "library_name": "mlx",
+  "model_type": "step3p7",
+  "architectures": [
+    "Step3p7ForConditionalGeneration"
+  ],
+  "base_model": "stepfun-ai/Step-3.7-Flash",
+  "language_model_type": "step3p5",
+  "vision_model_type": "step_robotics_vision_encoder",
+  "image_token_id": 128001,
+  "image_grid_token_count_global": 169,
+  "image_grid_token_count_patch": 81,
+  "image_size_global": 728,
+  "image_size_patch": 504,
+  "vision_hidden_size": 1536,
+  "vision_layers": 47,
+  "vision_downsample_factor": 4,
+  "license": "Apache-2.0 (adapter code) / Step Robotics license (upstream weights — see https://huggingface.co/stepfun-ai/Step-3.7-Flash)"
+}
