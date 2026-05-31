@@ -274,6 +274,58 @@ class PyramidKVCache(KVCache):
         self._logical_offset -= n
         return n
 
+    # ---- SSD persistence (oMLX paged_ssd_cache) -----------------------------
+    #
+    # 2026-05-31 second iteration:
+    # Earlier attempt returned a 4-tuple from ``.state`` to ship
+    # ``_logical_offset`` + ``_compressed`` alongside (keys, values). That
+    # broke ``prefix_cache._extract_block_tensor_slice`` which does
+    # ``keys, values = state`` and raised "too many values to unpack
+    # (expected 2)" for every block save → no per-block-hash entries
+    # written → next request's cache lookup misses.
+    #
+    # Final shape: ``.state`` stays as the 2-tuple expected by all of
+    # oMLX's block tensor handling. ``_logical_offset`` and ``_compressed``
+    # are exposed via ``meta_state`` (the parallel channel that
+    # RotatingKVCache uses for ``(keep, max_size, offset, _idx)``).
+    # ``meta_state.setter`` re-hydrates both fields on restore. SSD
+    # snapshots save+load via ``cache.state`` AND ``cache.meta_state`` per
+    # the ``_BaseCache`` contract.
+    @property
+    def state(self):
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, v):
+        if v is None:
+            return
+        self.keys, self.values = v[0], v[1]
+        # Parent KVCache.state setter would do
+        # ``self.offset = self.keys.shape[-2]`` which routes through our
+        # offset.setter and clobbers _logical_offset to the *physical*
+        # buffer size. Skip that — meta_state.setter restores it
+        # correctly from the saved (logical_offset, compressed) tuple.
+
+    @property
+    def meta_state(self) -> tuple:
+        return (int(self._logical_offset), int(bool(self._compressed)))
+
+    @meta_state.setter
+    def meta_state(self, v) -> None:
+        if v is None or v == "" or len(v) == 0:
+            return
+        if len(v) >= 2:
+            try:
+                self._logical_offset = int(v[0])
+                self._compressed = bool(int(v[1]))
+            except (TypeError, ValueError):
+                # Legacy or malformed meta — fall back to assuming the
+                # cache is uncompressed.
+                self._logical_offset = (
+                    self.keys.shape[-2] if self.keys is not None else 0
+                )
+                self._compressed = False
+
 
 # Note: do NOT monkey-patch mlx_lm.generate._make_cache to pass PyramidKVCache
 # through as a "batch cache". Tried 2026-05-30: it makes _make_cache succeed
@@ -283,6 +335,275 @@ class PyramidKVCache(KVCache):
 # gracefully → standard decode continues on the compressed cache — is correct.
 # MTP loses speculative decoding after an extend, but the request still
 # completes.
+
+
+def _register_pyramidkv_cache_handler() -> None:
+    """Register a non-sliceable handler for PyramidKVCache with oMLX's
+    CacheTypeRegistry. Without this, oMLX defaults to KVCacheHandler which
+    reports ``supports_block_slicing=True``, causing the prefix-cache save
+    path to slice the post-PKV compressed buffer (e.g. 8K slots) at original
+    prefill block positions (e.g. block 32 = tokens 16384–16896). The slice
+    is out-of-bounds, the save produces empty / wrong block data, the SSD
+    write either fails or stores garbage. On the next request, the trie
+    matches the prefix hashes but ``load_block_with_metadata`` returns None
+    for block 1+, the reconstruction loop short-circuits at the first miss,
+    and the surviving block 0 then trips the RotatingKVCache placeholder
+    reject because no boundary snapshot was captured at the 512-token mark.
+
+    Net symptom: ``Partial cache reconstruction: 1/N blocks, 512 tokens``
+    followed by ``RotatingKVCache layer 1: ... Rejecting cache``.
+
+    A non-sliceable handler routes through oMLX's "last-block-only +
+    boundary-snapshot" path (same lane as RotatingKVCache), which never
+    asks the compressed buffer for an out-of-range slice. Same-prefix
+    requests then restore the cache as a single full-state object (logical
+    offset preserved via the 4-tuple state), exactly like RotatingKVCache.
+
+    Verified 2026-05-31: PKV-off cold→warm gave 97.8% cache hit. With this
+    handler PKV-on should match that pattern.
+
+    Idempotent on import; safe to call multiple times.
+    """
+    try:
+        from omlx.cache.type_handlers import (
+            CacheType,
+            CacheTypeHandler,
+            CacheStateAxisInfo,
+        )
+        from omlx.cache.type_registry import CacheTypeRegistry
+    except Exception:
+        return  # Not running under oMLX (e.g. plain mlx-vlm import). No-op.
+
+    if "PyramidKVCache" in getattr(CacheTypeRegistry, "_class_name_map", {}):
+        return  # already registered
+
+    class PyramidKVCacheHandler(CacheTypeHandler):
+        """Mirror of RotatingKVCacheHandler with PyramidKVCache reconstruction.
+
+        PyramidKVCache post-compression has a physical buffer (≤ pyramidkv_
+        max_capacity) that does NOT match its logical offset (the original
+        prompt length). The buffer's slot order is not position-monotone —
+        slots are picked top-k by attention score — so per-block slicing
+        along the sequence axis produces empty or wrong data.
+        """
+
+        @property
+        def cache_type(self) -> CacheType:
+            # No dedicated enum value; reuse KVCACHE for registry slot.
+            # The lookup path uses class_name → handler directly, so this
+            # tag only affects metadata serialization.
+            return CacheType.KVCACHE
+
+        @property
+        def supports_block_slicing(self) -> bool:
+            return False  # ← the load-bearing flag
+
+        def get_state_axis_info(self) -> tuple:
+            return (
+                CacheStateAxisInfo(name="keys", sequence_axis=2, sliceable=False),
+                CacheStateAxisInfo(name="values", sequence_axis=2, sliceable=False),
+            )
+
+        def extract_state(self, cache_obj):
+            # PyramidKVCache.state is now a 2-tuple; _logical_offset /
+            # _compressed live in meta_state.
+            keys, values = cache_obj.state
+            meta = cache_obj.meta_state
+            return {
+                "keys": keys,
+                "values": values,
+                "logical_offset": int(meta[0]) if meta and len(meta) >= 1 else int(
+                    getattr(cache_obj, "_logical_offset", 0)
+                ),
+                "compressed": bool(int(meta[1])) if meta and len(meta) >= 2 else bool(
+                    getattr(cache_obj, "_compressed", False)
+                ),
+                "meta_state": meta,
+                "cache_type": "PyramidKVCache",
+            }
+
+        def get_seq_len(self, state: dict) -> int:
+            # Effective sequence length is the LOGICAL offset (pre-
+            # compression count), not the physical buffer size.
+            return int(state.get("logical_offset", 0))
+
+        def slice_state(self, state: dict, start_idx: int, end_idx: int):
+            # Non-sliceable: return full state. Mirrors RotatingKVCacheHandler.
+            return {
+                "keys": state.get("keys"),
+                "values": state.get("values"),
+                "logical_offset": state.get("logical_offset", 0),
+                "compressed": state.get("compressed", False),
+                "meta_state": state.get("meta_state", ()),
+                "is_full_state": True,
+                "cache_type": "PyramidKVCache",
+            }
+
+        def concatenate_states(self, states: list) -> dict:
+            if not states:
+                return {}
+            # Use the most recent state — same as RotatingKVCache.
+            latest = states[-1]
+            return {
+                "keys": latest.get("keys"),
+                "values": latest.get("values"),
+                "logical_offset": latest.get("logical_offset", 0),
+                "compressed": latest.get("compressed", False),
+                "meta_state": latest.get("meta_state", ()),
+                "is_full_state": True,
+                "cache_type": "PyramidKVCache",
+            }
+
+        def reconstruct_cache(self, state: dict, meta_state=None):
+            keys = state.get("keys")
+            values = state.get("values")
+            if keys is None or values is None:
+                return None
+            cache = PyramidKVCache()
+            cache.keys = keys
+            cache.values = values
+            cache._logical_offset = int(state.get("logical_offset", 0))
+            cache._compressed = bool(state.get("compressed", False))
+            return cache
+
+    handler = PyramidKVCacheHandler()
+
+    # Register class-name → handler. Two integration points needed:
+    # (1) ``_class_name_map`` (route ``get_handler_by_class_name`` for our class)
+    # (2) Direct override of ``get_handler_by_class_name`` so that even though
+    #     "PyramidKVCache" maps to ``CacheType.KVCACHE``, the lookup returns
+    #     our non-sliceable handler instead of the registered KVCacheHandler.
+    CacheTypeRegistry._class_name_map["PyramidKVCache"] = CacheType.KVCACHE
+
+    original_get_by_name = CacheTypeRegistry.get_handler_by_class_name
+
+    def _patched_get_handler_by_class_name(cls, class_name):
+        if class_name == "PyramidKVCache":
+            return handler
+        # Preserve the original classmethod's binding by calling through __func__.
+        try:
+            return original_get_by_name.__func__(cls, class_name)
+        except AttributeError:
+            # Already an unbound function (unlikely but defensive).
+            return original_get_by_name(class_name)
+
+    CacheTypeRegistry.get_handler_by_class_name = classmethod(
+        _patched_get_handler_by_class_name
+    )
+
+
+_register_pyramidkv_cache_handler()
+
+
+def _patch_omlx_emit_prefill_boundary_snapshot() -> None:
+    """Fix oMLX's chunked-prefill VLM path so boundary snapshots actually
+    get persisted instead of being silently dropped on the floor.
+
+    THE BUG (oMLX 0.3.12 ``omlx/scheduler.py`` at the time of writing):
+
+    - Non-chunked ``_do_external_prefill`` sets up a ``request_id → temp_uid``
+      mapping at scheduler.py:5035-5037 BEFORE calling itself, so
+      ``_emit_prefill_boundary_snapshot``'s lookup
+      ``uid = self.request_id_to_uid.get(request.request_id, -1)`` returns a
+      real uid and the snapshot lands in ``_boundary_cache_snapshots``.
+    - The chunked path (``_begin_prefill`` → ``_step_prefill_chunk``) is
+      missing that setup. Any model that hits the chunked path — which
+      includes every VLM model on text-only prompts longer than
+      ``prefill_step_size`` (Step-3.7-Flash with a 20 K prompt is the
+      canonical case) — emits boundary snapshots with ``uid = -1``.
+    - ``_on_prefill_boundary_snapshot`` then does
+      ``self.uid_to_request_id.get(-1) is None`` → ``return`` → snapshot
+      thrown away.
+
+    Symptom (with PKV ON): cross-request prefix cache reuse looks completely
+    broken. Trie matches the prefix hashes, ``load_block_with_metadata``
+    returns None for every block past block 0 (no per-block-hash entry was
+    ever written), reconstruction reports ``1/N blocks, 512 tokens``,
+    walk-back sees RotatingKVCache placeholder in block 0, ``Rejecting
+    cache to prevent stale sliding-window state``, request re-prefills the
+    full prompt. 2026-05-31 REDACTED-IP fan-out reported 130 such events in a
+    single day, ~7 GB of prefix-cache reuse lost. With this patch +
+    ``PyramidKVCacheHandler`` + 2-tuple ``.state`` (Invariants 11-12 below),
+    PKV-on cache reuse is identical to PKV-off: 97.8% cached on a same-
+    prompt resend, 20 K prefill cold→warm 60 s → 2.6 s (23× speedup).
+
+    Fix: override ``_emit_prefill_boundary_snapshot`` to bypass the uid
+    round-trip entirely. Build ``snapshot_cache`` the same way the original
+    does (keep non-sliceable layers, None-out sliceable ones), then save
+    directly under ``request.request_id`` — the actual storage key used by
+    ``_get_boundary_store_override`` and ``_BoundarySnapshotProvider`` at
+    restoration time.
+
+    Idempotent. Safe to call on every model load.
+    """
+    try:
+        from omlx.scheduler import Scheduler as _Scheduler  # type: ignore
+        from omlx import scheduler as _sched_mod
+    except Exception:
+        return
+
+    if getattr(_Scheduler, "_pkv_emit_bypass_patched", False):
+        return
+    _Scheduler._pkv_emit_bypass_patched = True
+
+    _KNOWN_SLICEABLE = _sched_mod._KNOWN_SLICEABLE_CACHE_TYPES
+
+    def _wrapped_emit(self, request, prompt_cache, total_tokens):
+        # Build snapshot_cache the same way the original does:
+        # keep non-sliceable layers (PyramidKVCache, RotatingKVCache, …),
+        # None-out sliceable ones.
+        try:
+            snapshot_cache = [
+                c if type(c).__name__ not in _KNOWN_SLICEABLE else None
+                for c in prompt_cache
+            ]
+        except Exception:
+            return
+
+        # Mirror the original gating exactly.
+        if not self._cache_list_needs_boundary_snapshot(snapshot_cache):
+            return
+
+        block_size = self.config.paged_cache_block_size
+        if block_size <= 0 or total_tokens <= 0 or (total_tokens % block_size != 0):
+            return
+
+        request_id = getattr(request, "request_id", None)
+        if request_id is None:
+            return
+
+        if request_id not in self._boundary_cache_snapshots:
+            self._boundary_cache_snapshots[request_id] = {}
+
+        # Skip duplicate at the same token_count.
+        if total_tokens in self._boundary_cache_snapshots[request_id]:
+            return
+
+        # Offload to SSD when available; in-memory fallback otherwise.
+        if self._boundary_snapshot_store is not None:
+            try:
+                with self._phase_timer("boundary_snapshot_save"):
+                    saved = self._boundary_snapshot_store.save(
+                        request_id,
+                        total_tokens,
+                        snapshot_cache,
+                        self._extract_cache_states,
+                    )
+            except Exception:
+                saved = False
+            if saved:
+                self._boundary_cache_snapshots[request_id][total_tokens] = None
+            else:
+                self._boundary_cache_snapshots[request_id][total_tokens] = snapshot_cache
+        else:
+            self._boundary_cache_snapshots[request_id][total_tokens] = snapshot_cache
+
+        self._boundary_snapshot_required = True
+
+    _Scheduler._emit_prefill_boundary_snapshot = _wrapped_emit
+
+
+_patch_omlx_emit_prefill_boundary_snapshot()
 
 
 # ============================================================================
