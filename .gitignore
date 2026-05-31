@@ -7,3 +7,6 @@ __pycache__/
 .idea/
 .vscode/
 *.bak-*
+
+# Local-only — Claude Code notes with internal infra refs.
+CLAUDE.md
