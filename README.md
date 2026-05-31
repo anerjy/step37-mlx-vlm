@@ -183,7 +183,7 @@ lm_head.
 
 The MTP path activates automatically when these settings are set on
 `Step-3.7-Flash-4bit` (or your equivalent model id) in
-`your engine settings file`:
+your engine's model settings file:
 
 ```json
 {
@@ -195,7 +195,7 @@ The MTP path activates automatically when these settings are set on
 `mtp_enabled` and `turboquant_kv_enabled` are mutually exclusive per oMLX
 (TurboQuant patches the attention path that MTP relies on). Bench results
 above are with TurboQuant OFF. Restart oMLX after changing settings:
-`bash restart your engine`. Verify activation in the log:
+restart your engine process. Verify activation in the log:
 
 ```
 [engine] Native MTP patch applied for ... (model_type=step3p7, active)
@@ -227,9 +227,9 @@ python scripts/rewrite_mtp_shard.py \
   Gemma 4 spec dec on MLX was a useful template for diagnosing this one.
 
 To experiment, set `mtp_enabled: True` and `turboquant_kv_enabled: False`
-(they're mutually exclusive per oMLX) in `your engine settings file`
+(they're mutually exclusive per oMLX) in your engine's model settings file
 for `Step-3.7-Flash-4bit`, restart oMLX, and check
-`grep "MTP\[" your engine log` for accept rate. To run the
+`grep "MTP\[" <your-engine-log>` for accept rate. To run the
 shard rewrite yourself:
 
 ```bash

@@ -521,8 +521,8 @@ def _patch_omlx_emit_prefill_boundary_snapshot() -> None:
     ever written), reconstruction reports ``1/N blocks, 512 tokens``,
     walk-back sees RotatingKVCache placeholder in block 0, ``Rejecting
     cache to prevent stale sliding-window state``, request re-prefills the
-    full prompt. 2026-05-31 REDACTED-IP fan-out reported 130 such events in a
-    single day, ~7 GB of prefix-cache reuse lost. With this patch +
+    full prompt. A production fan-out workload reported 100+ such events
+    in a single day, several GB of prefix-cache reuse lost. With this patch +
     ``PyramidKVCacheHandler`` + 2-tuple ``.state`` (Invariants 11-12 below),
     PKV-on cache reuse is identical to PKV-off: 97.8% cached on a same-
     prompt resend, 20 K prefill cold→warm 60 s → 2.6 s (23× speedup).
