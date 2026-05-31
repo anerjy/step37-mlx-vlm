@@ -262,6 +262,28 @@ class PyramidKVCache(KVCache):
             self.keys.shape[-2] if self.keys is not None else 0
         )
 
+    def trim(self, n):
+        # Pre-compression trim: physically drop n tail slots.
+        if self._compressed or self.keys is None:
+            return 0
+        n = min(n, self.keys.shape[-2])
+        if n <= 0:
+            return 0
+        self.keys = self.keys[..., :-n, :]
+        self.values = self.values[..., :-n, :]
+        self._logical_offset -= n
+        return n
+
+
+# Note: do NOT monkey-patch mlx_lm.generate._make_cache to pass PyramidKVCache
+# through as a "batch cache". Tried 2026-05-30: it makes _make_cache succeed
+# but a downstream scheduler `_extend_cache` then calls `.extend()` on
+# PyramidKVCache (which has no such method), corrupting the cache and 500'ing.
+# Original behavior — `_make_cache` raises ValueError → MTP reconcile drops
+# gracefully → standard decode continues on the compressed cache — is correct.
+# MTP loses speculative decoding after an extend, but the request still
+# completes.
+
 
 # ============================================================================
 
@@ -562,16 +584,18 @@ class LanguageModel(nn.Module):
                 # No anchor captured for this layer — skip safely.
                 continue
 
-            # NOTE: temporarily use UNIFORM budget = max_cap across all
-            # full-attn layers. The arithmetic-pyramid budget (different
-            # per layer) breaks oMLX because the attention mask is created
-            # ONCE per forward call using cache[full_idx] and applied to
-            # ALL full-attn layers — so they all need the same K dimension.
-            # Re-enable per-layer budget after per-layer-mask plumbing
-            # (TBD: monkey-patch Step3p5Body.__call__ to rebuild mask per
-            # full layer).
-            budget = max_cap
-            _ = _pyramid_budget  # silence unused warning; keeps API ref
+            # Per-layer arithmetic-decay budget (bottom layers larger,
+            # top layers smaller — captures the "pyramidal information
+            # funneling" property from the paper). Enabled now that
+            # LanguageModel.__call__ builds a per-layer mask above.
+            budget = _pyramid_budget(
+                layer_idx=relative_full_idx,
+                num_full_layers=num_full,
+                max_capacity_prompt=max_cap,
+                window_size=ws,
+                seq_len=seq_len,
+                beta=beta,
+            )
             num_kv_groups = layer.self_attn.num_heads // layer.self_attn.num_kv_heads
             # For BatchKVCache we slice keys/values to the valid range first
             if isinstance(cache, _BatchKVCache):
@@ -686,17 +710,26 @@ class LanguageModel(nn.Module):
                         li, ct, offset, max_size, keep, buf_shape,
                     )
 
-        full_mask = None
+        # Mask construction. When PyramidKV is active with per-layer
+        # pyramid budgets, each full-attention layer can have a DIFFERENT
+        # cache size after compression (bottom layers larger budgets, top
+        # layers smaller). So build a per-layer mask for full-attn layers.
+        # When PyramidKV is off (or uniform budget), all full-attn caches
+        # share size and we could fall back to a single mask — but the
+        # per-layer build cost is negligible (a few μs per mask), so keep
+        # it unconditional for simpler code.
+        full_masks: List[Any] = [None] * body.num_layers
         swa_mask = None
-        if body._full_idx is not None:
-            full_mask = create_attention_mask(h, cache[body._full_idx])
+        for li, (lyr, c) in enumerate(zip(body.layers, cache)):
+            if not lyr.is_sliding:
+                full_masks[li] = create_attention_mask(h, c)
         if body._swa_idx is not None:
             swa_mask = create_attention_mask(
                 h, cache[body._swa_idx], window_size=body.args.sliding_window
             )
 
-        for layer, c in zip(body.layers, cache):
-            m = swa_mask if layer.is_sliding else full_mask
+        for li, (layer, c) in enumerate(zip(body.layers, cache)):
+            m = swa_mask if layer.is_sliding else full_masks[li]
             h = layer(h, mask=m, cache=c)
 
         # MTP receives PRE-norm hidden (matches vLLM Step3p5Model.forward
