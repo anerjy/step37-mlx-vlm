@@ -4,8 +4,9 @@ The underlying architecture is identical to step3p5 (45-layer Qwen3.6-style
 MoE with shared experts). We reuse mlx_lm.models.step3p5 directly and add
 the inputs_embeds plumbing that the VLM call path needs.
 """
+import math
 from dataclasses import asdict
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -17,9 +18,252 @@ from mlx_lm.models.step3p5 import (
     Step3p5DecoderLayer,
     ZeroCenteredRMSNorm,
 )
+from mlx_lm.models.cache import KVCache
 from mlx_lm.models.base import create_attention_mask
 
 from .config import TextConfig
+
+
+# ============================================================================
+# PyramidKV — Cai et al. 2024 (arxiv 2406.02069), MLX port.
+#
+# After prefill ends, full-attention layers' KV caches are compressed by
+# scoring each cached token's importance via attention from the last α
+# "instruction" tokens. Per-layer arithmetic-decay budget (bottom layers
+# keep more, top layers less). Empirically: 12% cache retention matches
+# full-cache quality (62.6 needle vs 65.0 full at 100K context).
+#
+# Reference implementation:
+#   https://github.com/Zefan-Cai/KVCache-Factory/blob/main/pyramidkv/pyramidkv_utils.py
+#
+# Design choices for Step-3.7 hybrid architecture:
+#   - Only compress the 12 full-attention layers. The 33 sliding-window=512
+#     layers are already O(window), no compression benefit.
+#   - GQA aggregation: scores summed across the n_heads-per-kv-head group
+#     before top-K, so each kv-head gets a single coherent index list.
+#   - Last `window_size` tokens always preserved verbatim (the standard
+#     "recent" guarantee from the original paper).
+#   - logical_offset decoupled from buffer size: cached K vectors retain
+#     their original RoPE positions; new K post-compression continues at
+#     the ORIGINAL position (e.g. 39061 after compressing a 39060-token
+#     prefill to 5000-slot cache).
+# ============================================================================
+
+
+def _pyramid_avg_pool_1d(x: mx.array, kernel_size: int = 5) -> mx.array:
+    """1D average pool along last axis with SAME zero padding."""
+    if kernel_size <= 1:
+        return x
+    pad = kernel_size // 2
+    pads = [(0, 0)] * (x.ndim - 1) + [(pad, pad)]
+    xp = mx.pad(x, pads)
+    pieces = [xp[..., i : i + x.shape[-1]] for i in range(kernel_size)]
+    return mx.stack(pieces, axis=0).sum(axis=0) / kernel_size
+
+
+def _pyramid_compress_layer(
+    keys: mx.array,
+    values: mx.array,
+    q_anchor: mx.array,
+    budget: int,
+    window_size: int,
+    num_key_value_groups: int,
+    kernel_size: int = 5,
+) -> Tuple[mx.array, mx.array]:
+    """Compress one layer's KV cache using PyramidKV scoring.
+
+    See module-level docstring for design notes. Returns (K, V) where the
+    sequence dim is min(N, budget). When N <= budget, returns inputs
+    unchanged.
+    """
+    B, n_kv_heads, N, head_dim = keys.shape
+    if N <= budget:
+        return keys, values
+    keep_from_past = budget - window_size
+    assert keep_from_past > 0, "budget must exceed window_size"
+
+    # GQA: expand kv to n_heads for score compute, then aggregate per kv-head
+    n_heads = q_anchor.shape[1]
+    if num_key_value_groups > 1:
+        keys_for_score = mx.repeat(keys, num_key_value_groups, axis=1)
+    else:
+        keys_for_score = keys
+
+    # Q · K^T / √d, scores from the last `window_size` queries
+    scale = 1.0 / math.sqrt(head_dim)
+    attn = mx.matmul(q_anchor, keys_for_score.swapaxes(-1, -2)) * scale
+
+    # Causal mask on the tail × tail sub-block (window queries vs window keys)
+    causal = mx.triu(mx.ones((window_size, window_size)) * -1e9, k=1)
+    tail = attn[..., -window_size:] + causal
+    attn = mx.concatenate([attn[..., :-window_size], tail], axis=-1)
+    attn = mx.softmax(attn.astype(mx.float32), axis=-1).astype(keys.dtype)
+
+    # Sum window-Q attention to each pre-window K position → score
+    score = attn[..., :-window_size].sum(axis=-2)  # (B, n_heads, N-ws)
+    score = _pyramid_avg_pool_1d(score, kernel_size=kernel_size)
+
+    # GQA aggregation: sum scores across each kv-head's group, then per-kv-head
+    # top-K. This gives each kv-head one coherent index list.
+    if num_key_value_groups > 1:
+        score = score.reshape(B, n_kv_heads, num_key_value_groups, -1).sum(axis=2)
+    # score now (B, n_kv_heads, N-ws)
+
+    neg = -score
+    topk_unsorted = mx.argpartition(neg, kth=keep_from_past - 1, axis=-1)[..., :keep_from_past]
+    topk_sorted = mx.sort(topk_unsorted, axis=-1)  # ascending temporal order
+
+    # Gather K, V at selected indices
+    indices = mx.broadcast_to(
+        mx.expand_dims(topk_sorted, axis=-1),
+        (B, n_kv_heads, keep_from_past, head_dim),
+    )
+    k_past = mx.take_along_axis(keys[..., :-window_size, :], indices, axis=2)
+    v_past = mx.take_along_axis(values[..., :-window_size, :], indices, axis=2)
+    k_window = keys[..., -window_size:, :]
+    v_window = values[..., -window_size:, :]
+    return (
+        mx.concatenate([k_past, k_window], axis=2),
+        mx.concatenate([v_past, v_window], axis=2),
+    )
+
+
+def _pyramid_budget(
+    layer_idx: int,
+    num_full_layers: int,
+    max_capacity_prompt: int,
+    window_size: int,
+    seq_len: int,
+    beta: int = 20,
+) -> int:
+    """Per-layer budget (arithmetic decay, bottom=most, top=least).
+
+    Returns total slots to keep INCLUDING the always-preserved window.
+    Returns seq_len when no compression needed.
+    """
+    if seq_len <= max_capacity_prompt:
+        return seq_len
+    min_num = (max_capacity_prompt - window_size) // beta
+    max_num = (max_capacity_prompt - window_size) * 2 - min_num
+    if max_num >= seq_len - window_size:
+        max_num = seq_len - window_size
+        min_num = (max_capacity_prompt - window_size) * 2 - max_num
+    step = (max_num - min_num) // max(num_full_layers - 1, 1)
+    keep_past = max_num - layer_idx * step
+    keep_past = max(keep_past, 1)
+    return keep_past + window_size
+
+
+# Module-level capture flag. When non-zero, Step3p5Attention's patched
+# __call__ saves Q[..., -window_size:, :] (post-RoPE) into
+# `self._pyramid_last_q` on each call. Off by default — zero cost.
+_PYRAMID_CAPTURE_WINDOW: int = 0
+
+
+def _install_pyramid_q_capture() -> None:
+    """One-shot monkey-patch: make Step3p5Attention save the tail Q.
+
+    Called from LanguageModel.__init__ when pyramidkv is enabled. The
+    patched __call__ saves Q[..., -_PYRAMID_CAPTURE_WINDOW:, :] (post-RoPE,
+    post-q_norm, post-transpose) on each forward when capture is active.
+
+    Idempotent: re-running is a no-op once the patch marker is set.
+    """
+    from mlx_lm.models.step3p5 import Step3p5Attention
+    if getattr(Step3p5Attention, "_pyramid_capture_patched", False):
+        return
+    original_call = Step3p5Attention.__call__
+
+    def patched_call(self, x, mask=None, cache=None):
+        # Reuse the entire original forward; capture Q post-everything.
+        ws = _PYRAMID_CAPTURE_WINDOW
+        if ws > 0 and x.shape[1] >= ws:
+            # Reproduce the Q computation path INLINE so we can save the
+            # post-RoPE Q without re-running attention. Then call the
+            # original __call__ for actual attention. Slightly wasteful
+            # (Q computed twice during prefill chunk that fires capture)
+            # but only matters for the chunks where capture runs (the
+            # last chunk of prefill at most).
+            B, L, _ = x.shape
+            q_full = self.q_proj(x)
+            q_full = self.q_norm(
+                q_full.reshape(B, L, self.num_heads, -1)
+            ).transpose(0, 2, 1, 3)
+            if cache is not None:
+                q_full = self.rope(q_full, offset=cache.offset)
+            else:
+                q_full = self.rope(q_full)
+            self._pyramid_last_q = q_full[..., -ws:, :]
+        return original_call(self, x, mask=mask, cache=cache)
+
+    Step3p5Attention.__call__ = patched_call
+    Step3p5Attention._pyramid_capture_patched = True
+
+
+def _set_pyramid_capture_active(window_size: int) -> None:
+    """Toggle capture; window_size=0 to disable."""
+    global _PYRAMID_CAPTURE_WINDOW
+    _PYRAMID_CAPTURE_WINDOW = int(window_size)
+
+
+class PyramidKVCache(KVCache):
+    """KVCache with a LOGICAL offset that survives PyramidKV compression.
+
+    After compression, ``self.keys.shape[-2]`` shrinks (e.g. 39060 → 5000)
+    but the next decode step should still RoPE-position-encode at the
+    original 39061. Parent KVCache.update_and_fetch resets self.offset to
+    buffer-size every call; we override to advance offset by S instead.
+
+    Cached K vectors retain their original RoPE-positions (applied during
+    prefill at insertion time), so Q·K dot products use correct relative
+    positional angles even though the slot order may differ from absolute
+    position order.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._logical_offset = 0
+        self._compressed = False
+
+    def update_and_fetch(self, keys, values):
+        S = keys.shape[-2]
+        if self.keys is None:
+            self.keys = keys
+            self.values = values
+        else:
+            self.keys = mx.concatenate([self.keys, keys], axis=-2)
+            self.values = mx.concatenate([self.values, values], axis=-2)
+        # KEY DIFFERENCE: advance logical offset by S, NOT to buffer size.
+        # When self._compressed is True (post-PyramidKV), buffer < logical.
+        self._logical_offset += S
+        return self.keys, self.values
+
+    @property
+    def offset(self):
+        return self._logical_offset
+
+    @offset.setter
+    def offset(self, v):
+        self._logical_offset = int(v)
+
+    def install_compressed(self, new_keys: mx.array, new_values: mx.array) -> None:
+        """Replace cached tensors with their compressed versions.
+
+        Preserves logical offset — caller must NOT touch ``self.offset``
+        after this call.
+        """
+        self.keys = new_keys
+        self.values = new_values
+        self._compressed = True
+
+    def is_trimmable(self):
+        # Post-compression trim semantics are subtle; conservatively disable.
+        return not self._compressed and self._logical_offset < (
+            self.keys.shape[-2] if self.keys is not None else 0
+        )
+
+
+# ============================================================================
 
 
 # ============================================================================
@@ -188,6 +432,18 @@ class LanguageModel(nn.Module):
         else:
             self.mtp = None
 
+        # PyramidKV: install Q-anchor capture monkey-patch and activate
+        # capture iff config.pyramidkv_max_capacity > 0.
+        self._pyramid_cap = int(getattr(config, "pyramidkv_max_capacity", 0) or 0)
+        self._pyramid_ws = int(getattr(config, "pyramidkv_window_size", 32) or 32)
+        self._pyramid_kernel = int(getattr(config, "pyramidkv_kernel_size", 5) or 5)
+        self._pyramid_beta = int(getattr(config, "pyramidkv_beta", 20) or 20)
+        if self._pyramid_cap > 0:
+            _install_pyramid_q_capture()
+            _set_pyramid_capture_active(self._pyramid_ws)
+        # Per-cache `_compressed` flag (on PyramidKVCache) is the source of
+        # truth for idempotency — no per-model flag needed.
+
     @property
     def layers(self):
         return self.model.layers
@@ -195,14 +451,165 @@ class LanguageModel(nn.Module):
     def make_cache(self):
         # Reuse step3p5.Model's cache builder by reconstructing it via the
         # underlying layers.
+        #
+        # Cache type selection (priority order):
+        #   1. pyramidkv_max_capacity > 0 → PyramidKVCache for full-attn
+        #      layers, plain RotatingKVCache for sliding (PyramidKV needs
+        #      unbounded prefill cache to score from). Sink ignored.
+        #   2. attention_sink_size + attention_sink_window > 0 → sink
+        #      RotatingKVCache for full-attn (StreamingLLM-style).
+        #   3. Default → unbounded KVCache for full-attn, sliding
+        #      RotatingKVCache for sliding.
+        #
+        # Attention-sink hook: when config declares both attention_sink_size
+        # and attention_sink_window > 0, the 12 full-attention layers get
+        # RotatingKVCache(max_size=window, keep=sink) instead of unbounded
+        # KVCache. RotatingKVCache natively supports the StreamingLLM
+        # "keep first K" pattern via its ``keep`` param — MLX engineers
+        # shipped this already (cache.py:413, 424).
+        #
+        # Convention: ``attention_sink_window`` is the TOTAL cache slot count
+        # (sink slots inclusive). Effective rotating recall = window - sink.
+        # We use total-not-rotating-portion because oMLX's paged cache
+        # alignment (scheduler.py:1291) requires ALL RotatingKVCache
+        # max_sizes to be the same after divide-down to a common block size
+        # (block_size must divide every max_size). Step3p5 sliding layers
+        # use max_size=512; so sink+full-attn cache max_size must be a
+        # multiple of 512. With window=8192 (=16×512), the constraint
+        # is satisfied and effective recall is window-sink=8188 tokens.
+        # Sliding-attention layers are unchanged; they're already O(512).
         from mlx_lm.models.cache import KVCache, RotatingKVCache
+        cfg = self.config
+        sink = int(getattr(cfg, "attention_sink_size", 0) or 0)
+        window = int(getattr(cfg, "attention_sink_window", 0) or 0)
+        pkv_cap = int(getattr(cfg, "pyramidkv_max_capacity", 0) or 0)
+        use_sink = sink > 0 and window > sink
+        use_pkv = pkv_cap > 0
         caches = []
         for layer in self.model.layers:
             if getattr(layer, "is_sliding", False):
                 caches.append(RotatingKVCache(max_size=self._args.sliding_window))
+            elif use_pkv:
+                caches.append(PyramidKVCache())
+            elif use_sink:
+                caches.append(RotatingKVCache(max_size=window, keep=sink))
             else:
                 caches.append(KVCache())
         return caches
+
+    def pyramid_compress_caches(self, cache_list: List[Any]) -> int:
+        """Apply PyramidKV compression to full-attention layer caches.
+
+        Called once at the boundary between prefill and decode. Skips
+        sliding-attention layers (already O(window)) and any non-
+        PyramidKVCache instance. Reads each layer's captured Q-anchor
+        (saved by the install_pyramid_q_capture monkey-patch during PP)
+        and replaces (keys, values) in the cache with the compressed
+        versions while preserving the logical offset.
+
+        Returns the count of layers compressed (0 if disabled).
+        """
+        if self._pyramid_cap <= 0:
+            return 0
+
+        import logging as _logging
+        _log = _logging.getLogger("PYRAMID_KV")
+
+        body = self.model
+        ws = self._pyramid_ws
+        max_cap = self._pyramid_cap
+        beta = self._pyramid_beta
+        kernel = self._pyramid_kernel
+
+        # Count full-attention layers (the only ones we compress).
+        full_layer_idxs = [
+            i for i, lyr in enumerate(body.layers) if not getattr(lyr, "is_sliding", False)
+        ]
+        num_full = len(full_layer_idxs)
+        if num_full == 0:
+            return 0
+
+        n_compressed = 0
+        # Lazy import — BatchKVCache lives in mlx_lm.models.cache; oMLX
+        # swaps our PyramidKVCache instance for BatchKVCache during the
+        # request-prep stage (it manages cache lifecycle for batched
+        # serving). So we accept BOTH cache types — for BatchKVCache we
+        # operate on the underlying tensors directly (cache.keys[..., :idx],
+        # cache.values, cache._idx) and trust that cache.offset already
+        # tracks the logical token position correctly.
+        from mlx_lm.models.cache import BatchKVCache as _BatchKVCache
+
+        for relative_full_idx, abs_idx in enumerate(full_layer_idxs):
+            cache = cache_list[abs_idx]
+            if cache.keys is None:
+                continue
+            # Already-compressed caches skip (idempotent). Layer 0's budget
+            # can exceed max_cap (arithmetic decay puts ~2× there) so we
+            # can't rely on shape-based detection alone.
+            if getattr(cache, "_pyramid_done", False):
+                continue
+            # For BatchKVCache, the "valid" length is cache._idx; for our
+            # PyramidKVCache, it's the buffer shape.
+            if isinstance(cache, _BatchKVCache):
+                seq_len = int(cache._idx)
+            else:
+                seq_len = cache.keys.shape[-2]
+            if seq_len <= max_cap:
+                continue
+            layer = body.layers[abs_idx]
+            q_anchor = getattr(layer.self_attn, "_pyramid_last_q", None)
+            if q_anchor is None or q_anchor.shape[-2] < ws:
+                # No anchor captured for this layer — skip safely.
+                continue
+
+            # NOTE: temporarily use UNIFORM budget = max_cap across all
+            # full-attn layers. The arithmetic-pyramid budget (different
+            # per layer) breaks oMLX because the attention mask is created
+            # ONCE per forward call using cache[full_idx] and applied to
+            # ALL full-attn layers — so they all need the same K dimension.
+            # Re-enable per-layer budget after per-layer-mask plumbing
+            # (TBD: monkey-patch Step3p5Body.__call__ to rebuild mask per
+            # full layer).
+            budget = max_cap
+            _ = _pyramid_budget  # silence unused warning; keeps API ref
+            num_kv_groups = layer.self_attn.num_heads // layer.self_attn.num_kv_heads
+            # For BatchKVCache we slice keys/values to the valid range first
+            if isinstance(cache, _BatchKVCache):
+                cache_k_valid = cache.keys[..., :seq_len, :]
+                cache_v_valid = cache.values[..., :seq_len, :]
+            else:
+                cache_k_valid = cache.keys
+                cache_v_valid = cache.values
+            new_k, new_v = _pyramid_compress_layer(
+                cache_k_valid,
+                cache_v_valid,
+                q_anchor,
+                budget=budget,
+                window_size=ws,
+                num_key_value_groups=num_kv_groups,
+                kernel_size=kernel,
+            )
+            mx.eval(new_k, new_v)
+            if isinstance(cache, _BatchKVCache):
+                # Replace buffer + set _idx to new compressed length.
+                # cache.offset (per-batch token count for RoPE) stays.
+                cache.keys = new_k
+                cache.values = new_v
+                cache._idx = new_k.shape[-2]
+                cache._pyramid_done = True
+            else:
+                cache.install_compressed(new_k, new_v)
+                cache._pyramid_done = True
+            # Free the captured Q now that compression is done
+            layer.self_attn._pyramid_last_q = None
+            n_compressed += 1
+
+        if n_compressed > 0:
+            _log.info(
+                "[PyramidKV] compressed %d full-attn layers (budget=%d, window=%d)",
+                n_compressed, self._pyramid_cap, self._pyramid_ws,
+            )
+        return n_compressed
 
     def make_mtp_cache(self):
         """One KVCache per MTP layer (each MTP block is a full decoder layer).
@@ -243,6 +650,41 @@ class LanguageModel(nn.Module):
 
         if cache is None:
             cache = [None] * body.num_layers
+
+        # PyramidKV trigger: compresses each full-attn layer's cache from
+        # ~N tokens to ~max_capacity_prompt tokens after PP ends. Idempotent
+        # (per-cache _pyramid_done flag).
+        if self._pyramid_cap > 0 and h.shape[1] <= 16:
+            self.pyramid_compress_caches(cache)
+
+        # 2026-05-30 DEBUG: log cache types per layer when prompt is "long enough".
+        # Triggered only when env var STEP37_CACHE_DEBUG=1. Uses h.shape (the
+        # embedded tensor) so VLM-via-inputs_embeds path also triggers.
+        import os as _os
+        if _os.environ.get("STEP37_CACHE_DEBUG") == "1":
+            try:
+                seq_dim = h.shape[1] if hasattr(h, "shape") else 0
+            except Exception:
+                seq_dim = 0
+            if seq_dim > 100:
+                import logging as _logging
+                _log = _logging.getLogger("STEP37_CACHE")
+                _log.warning(
+                    "[STEP37 cache] h.shape=%s inputs.shape=%s",
+                    tuple(h.shape) if hasattr(h, "shape") else None,
+                    tuple(inputs.shape) if inputs is not None and hasattr(inputs, "shape") else None,
+                )
+                for li, c in enumerate(cache[:6]):
+                    ct = type(c).__name__ if c is not None else "None"
+                    offset = getattr(c, "offset", "?") if c is not None else "?"
+                    max_size = getattr(c, "max_size", "?") if c is not None else "?"
+                    keep = getattr(c, "keep", "?") if c is not None else "?"
+                    buf = getattr(c, "keys", None)
+                    buf_shape = tuple(buf.shape) if buf is not None else None
+                    _log.warning(
+                        "  layer %d: %s offset=%s max_size=%s keep=%s buffer_shape=%s",
+                        li, ct, offset, max_size, keep, buf_shape,
+                    )
 
         full_mask = None
         swa_mask = None

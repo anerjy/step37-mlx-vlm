@@ -273,6 +273,14 @@ class Model(nn.Module):
     def make_mtp_cache(self):
         return self.language_model.make_mtp_cache()
 
+    def pyramid_compress_caches(self, cache_list):
+        """Pass-through to LanguageModel.pyramid_compress_caches."""
+        return self.language_model.pyramid_compress_caches(cache_list)
+
+    @property
+    def pyramid_enabled(self):
+        return getattr(self.language_model, "_pyramid_cap", 0) > 0
+
     @property
     def has_mtp(self):
         return getattr(self.language_model, "mtp", None) is not None

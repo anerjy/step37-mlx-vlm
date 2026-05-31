@@ -78,6 +78,26 @@ class TextConfig(BaseModelConfig):
     # BF16. NVFP4 / our 4-bit drop them; Hikari07jp re-extracted shard adds them
     # back. LanguageModel.__init__ builds MTPModule iff this is > 0.
     num_nextn_predict_layers: int = 0
+    # Attention sink (StreamingLLM): when both > 0, the 12 full-attention
+    # layers switch from unbounded KVCache to RotatingKVCache(max_size=sink+
+    # window, keep=sink). Sliding-attention layers are unchanged (already
+    # RotatingKVCache at window_size=512). Default 0/0 = disabled (no
+    # truncation, original behavior). Tradeoff: full-attention compute drops
+    # from O(N²) to O(sink+window), but long-range recall (positions
+    # sink..N-window) is lost. Recommended: keep tiny (sink=4) per the
+    # StreamingLLM paper; tune window to your prompt length distribution.
+    attention_sink_size: int = 0
+    attention_sink_window: int = 0
+    # PyramidKV (Cai et al. 2024) — post-prefill KV cache compression.
+    # When > 0, full-attention layers' caches are compressed after PP ends:
+    # each cached token is scored by attention from the last
+    # `pyramidkv_window_size` queries; per-layer arithmetic-decay budget
+    # decides how many tokens to keep. Sliding-attention layers are
+    # untouched. Default 0 = disabled (no compression).
+    pyramidkv_max_capacity: int = 0
+    pyramidkv_window_size: int = 32
+    pyramidkv_kernel_size: int = 5
+    pyramidkv_beta: int = 20
 
 
 @dataclass
